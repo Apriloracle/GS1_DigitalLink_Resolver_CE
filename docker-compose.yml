@@ -28,6 +28,10 @@ services:
   web-service:
     build: './web_server'
     container_name: resolver-web-server
+    environment:
+      # Optional: Fallback hook for Distributed P2P Mesh Resolution 
+      # Uncomment and set to your external resolver gateway URL on 404 local misses
+      # - EXTERNAL_RESOLVER_URL=http://your-mesh-gateway-url.com
     depends_on:
       - database-service
     restart: always
