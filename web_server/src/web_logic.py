@@ -4,6 +4,7 @@ import subprocess
 import sys
 import traceback
 import warnings
+import requests
 
 
 import web_db
@@ -535,13 +536,109 @@ def _validate_and_fetch_document(identifier, qualifier_path, doc_id):
         # If you wish you can add other AI codes to this list if you think you would like to apply the same
         # logic to them. For example, partial GTINs (01) might be useful. If so, just add their AI code with a
         # leading and trailing forward-slash to the 'prefixes' list below. e.g. adding GTIN:
-        #     if any(identifier.startswith(prefix) for prefix in  = ['/8003/', '/8004/', '/00/', '/01/']):
+        #     if any(identifier.startswith(prefix) for prefix in ['/8003/', '/8004/', '/00/', '/01/']):
         # We include both leading and trailing forward-slashes to ensure we are matching the AI code and not
         # a partial match of the AI value.
         if any(identifier.startswith(prefix) for prefix in ['/8003/', '/8004/', '/00/']):
             serialised_document = _process_serialised_identifier(identifier)
             if serialised_document is not None:
                 return serialised_document
+
+        # ---------------------------------------------------------
+        # 2. DISTRIBUTED P2P MESH FALLBACK (404 INTERCEPTION)
+        # ---------------------------------------------------------
+        external_resolver_url = os.getenv('EXTERNAL_RESOLVER_URL')
+        
+        if external_resolver_url:
+            try:
+                # Extract GTIN from doc_id (e.g., "01_06111037000599" -> "06111037000599")
+                if '_' in doc_id:
+                    clean_gtin = doc_id.split('_', 1)[1]
+                else:
+                    clean_gtin = doc_id
+                
+                # Aggressively strip ALL leading zeros to get the base identifier
+                base_gtin = clean_gtin.lstrip('0')
+                
+                # Try the unpadded GTIN first, then fallback to the original padded one
+                gtins_to_try = [base_gtin]
+                if clean_gtin != base_gtin:
+                    gtins_to_try.append(clean_gtin)
+                
+                print(f"DEBUG: Local DB Miss. Checking Mesh Fallback for GTINs: {gtins_to_try}")
+                
+                for gtin in gtins_to_try:
+                    # Use the environment variable safely
+                    mesh_api_url = f"{external_resolver_url.rstrip('/')}/api/agent/{gtin}"
+                    
+                    # Short timeout so we don't block legacy resolution if mesh is unreachable
+                    mesh_response = requests.get(mesh_api_url, timeout=3.0) 
+                    
+                    if mesh_response.status_code == 200:
+                        mesh_data = mesh_response.json()
+                        
+                        if mesh_data.get('found') is True:
+                            print(f"DEBUG: ✅ Found via Distributed Mesh using GTIN: {gtin}")
+                            
+                            product_name = mesh_data.get('meta', {}).get('product_name', 'Mesh Product')
+                            
+                            # Construct public-facing URLs for the client's browser
+                            # Convert Docker's internal DNS to 'localhost' so the browser can reach it
+                            public_base_url = external_resolver_url.replace('host.docker.internal', 'localhost')
+                            viewer_url = f"{public_base_url.rstrip('/')}/?gtin={gtin}"
+                            public_api_url = f"{public_base_url.rstrip('/')}/api/agent/{gtin}"
+                            
+                            mesh_doc = {
+                                "response_status": 200,
+                                "data": {
+                                    "defaultLinktype": "gs1:pip",
+                                    "data": [
+                                        {
+                                            "qualifiers": [], # Mesh applies to the base product
+                                            "linkset": [
+                                                {
+                                                    "anchor": f"/01/{gtin}",
+                                                    "itemDescription": product_name,
+                                                    "https://gs1.org/voc/pip": [
+                                                        {
+                                                            "href": viewer_url,
+                                                            "title": "Decentralized Product Passport (Verified)",
+                                                            "type": "text/html",
+                                                            "hreflang": ["en"]
+                                                        }
+                                                    ],
+                                                    "https://gs1.org/voc/defaultLink": [
+                                                        {
+                                                            "href": viewer_url,
+                                                            "title": "Decentralized Product Passport (Verified)",
+                                                            "type": "text/html",
+                                                            "hreflang": ["en"]
+                                                        }
+                                                    ],
+                                                    "https://gs1.org/voc/epcis": [
+                                                        {
+                                                            "href": public_api_url,
+                                                            "title": "Raw Event Data (JSON)",
+                                                            "type": "application/json",
+                                                            "hreflang": ["en"]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                            return mesh_doc
+            except requests.RequestException as re:
+                print(f"DEBUG: Mesh fallback request failed/timeout: {str(re)}")
+            except Exception as e:
+                print(f"DEBUG: Mesh fallback logic error: {str(e)}")
+        else:
+            print("DEBUG: Mesh Fallback skipped because 'EXTERNAL_RESOLVER_URL' is not set in environment.")
+        # ---------------------------------------------------------
+        # MESH FALLBACK ENDS
+        # ---------------------------------------------------------
 
         # We have searched and there is no partial match that has template variables {0} or {1}
         return {"response_status": 404, "error": f"No document found for anchor: {doc_id}"}
